@@ -5,8 +5,8 @@ This module defines the routing API for the Amazon Robotics Hackathon.
 Students will implement the drive_unit_next_move function in this module.
 
 *****IMPORTANT*****
-Team name:
-Email address:
+Team name: SHIJ
+Email address: matsunagai84@gmail.com, haolun7788@gmail.com, jeremyhhj@gmail.com", "thanhnhantran1501@gmail.com
 *******************
 """
 
