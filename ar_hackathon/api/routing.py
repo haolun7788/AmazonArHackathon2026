@@ -11,6 +11,7 @@ Email address: matsunagai84@gmail.com, haolun7788@gmail.com, jeremyhhj@gmail.com
 """
 
 from typing import Optional
+import heapq
 from ar_hackathon.models.graph_state import GraphState
 
 
@@ -35,5 +36,64 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
         next_node_id: ID of an adjacent node to move to, or None to wait
                       at the current node
     """
-    # Student implementation here
-    pass
+    # If the unit can't be found or is currently in transit, wait
+    unit = state.get_drive_unit(drive_unit_id)
+    if unit is None:
+        return None
+    if unit.in_transit:
+        return None
+
+    start = unit.current_node
+
+    # Determine targets: if the unit has capacity, target the nearest available
+    # pod (one that is not currently being carried). If the unit is full,
+    # target the delivery station of the first carried pod.
+    targets = set()
+    if unit.has_capacity:
+        for pod in state.active_pods:
+            if pod.current_node is not None and pod.carried_by is None:
+                targets.add(pod.current_node)
+    else:
+        for pod in state.active_pods:
+            if pod.carried_by == unit.id:
+                targets.add(pod.destination_station)
+
+    if not targets:
+        return None
+
+    # Use Dijkstra's algorithm to find the shortest-weighted path to the
+    # nearest target node (weights are taken from edges' `weight` field).
+    dist = {start: 0.0}
+    prev = {}
+    heap = [(0.0, start)]
+
+    while heap:
+        d, node = heapq.heappop(heap)
+        if d > dist.get(node, float('inf')):
+            continue
+
+        if node in targets:
+            # Reconstruct path from start -> node
+            path = [node]
+            cur = node
+            while cur != start:
+                cur = prev[cur]
+                path.append(cur)
+            path.reverse()
+            if len(path) == 1:
+                return None
+            return path[1]
+
+        for nbr in state.neighbors(node):
+            edge = state.get_edge(node, nbr)
+            if edge is None:
+                continue
+            w = edge.weight
+            nd = d + w
+            if nd < dist.get(nbr, float('inf')):
+                dist[nbr] = nd
+                prev[nbr] = node
+                heapq.heappush(heap, (nd, nbr))
+
+    # No reachable target
+    return None
