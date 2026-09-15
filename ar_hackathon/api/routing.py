@@ -11,6 +11,7 @@ Email address: matsunagai84@gmail.com, haolun7788@gmail.com, jeremyhhj@gmail.com
 
 from typing import Optional, Dict, List, Tuple, FrozenSet
 import heapq
+import math
 
 from ar_hackathon.models.graph_state import GraphState
 from ar_hackathon.utils.routing_utils import is_valid_move
@@ -48,6 +49,9 @@ _dist_to_cache: Dict[int, Dict[int, float]] = {}
 
 _claimed_by: Dict[str, int] = {}   # pod_id -> unit_id currently pursuing it
 _unit_claim: Dict[int, str] = {}   # unit_id -> pod_id it is currently pursuing
+_last_assign_time: int = -1
+_reservations: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+_last_res_cleanup: int = -1
 
 
 def _graph_sig(state: GraphState) -> Tuple[FrozenSet[int], int]:
@@ -109,6 +113,69 @@ def _dist_to(target: int) -> Dict[int, float]:
     return cached
 
 
+def _cleanup_reservations(state: GraphState) -> None:
+    """Remove expired reservations up to the current time step."""
+    global _reservations, _last_res_cleanup
+    t = state.current_time_step
+    if t == _last_res_cleanup:
+        return
+    for edge, slots in list(_reservations.items()):
+        new_slots = [(s, e) for (s, e) in slots if e > t]
+        if new_slots:
+            _reservations[edge] = new_slots
+        else:
+            _reservations.pop(edge, None)
+    _last_res_cleanup = t
+
+
+def _is_reserved(from_node: int, to_node: int, start: int, end: int) -> bool:
+    """Check if edge (from_node,to_node) has any reservation overlapping [start,end)."""
+    key = (from_node, to_node)
+    slots = _reservations.get(key, [])
+    for s, e in slots:
+        if not (e <= start or s >= end):
+            return True
+    # also check reverse direction if edge is bidirectional
+    rev = (to_node, from_node)
+    slots = _reservations.get(rev, [])
+    for s, e in slots:
+        if not (e <= start or s >= end):
+            return True
+    return False
+
+
+def _reserve_edge(from_node: int, to_node: int, start: int, end: int) -> None:
+    key = (from_node, to_node)
+    _reservations.setdefault(key, []).append((start, end))
+
+
+def _a_star(start: int, target: int) -> float:
+    """A* search from start to target using cached reverse distances as
+    an admissible heuristic (if available). Returns the path cost or
+    float('inf') if target is unreachable.
+    """
+    if start == target:
+        return 0.0
+    # heuristic: shortest known distance from node -> target
+    dist_to_target = _dist_to(target)
+
+    g_score: Dict[int, float] = {start: 0.0}
+    heap = [(g_score[start] + dist_to_target.get(start, 0.0), start)]
+
+    while heap:
+        f, u = heapq.heappop(heap)
+        if u == target:
+            return g_score[u]
+        gu = g_score.get(u, float('inf'))
+        for v, w in _forward_adj.get(u, []):
+            ng = gu + w
+            if ng < g_score.get(v, float('inf')):
+                g_score[v] = ng
+                heapq.heappush(heap, (ng + dist_to_target.get(v, 0.0), v))
+
+    return float('inf')
+
+
 def _clean_claim(unit_id: int, state: GraphState) -> None:
     """Drop this unit's claim if the pod it was chasing was already picked
     up by someone else, delivered, or otherwise no longer waiting."""
@@ -148,23 +215,68 @@ def _find_new_target_pod(unit_id: int, state: GraphState,
     return best_pod
 
 
+def _global_greedy_assign(state: GraphState) -> None:
+    """Globally assign waiting pods to available units using a greedy
+    nearest-first strategy. Runs once per simulation timestep to avoid
+    conflicting per-unit claims and improve global efficiency.
+    """
+    global _claimed_by, _unit_claim
+    # collect candidate pods and units
+    pods = [p for p in state.active_pods if p.current_node is not None and p.carried_by is None]
+    units = [u for u in state.drive_units if not u.in_transit and u.has_capacity]
+    if not pods or not units:
+        _claimed_by.clear()
+        _unit_claim.clear()
+        return
+
+    # compute per-unit shortest-path distances
+    dist_map: Dict[int, Dict[int, float]] = {}
+    for u in units:
+        dist_map[u.id] = _dijkstra(_forward_adj, u.current_node)
+
+    # build all (distance, entry_time, unit_id, pod_id) tuples so older
+    # pods (smaller entry_time) are preferred in ties and near ties.
+    triples: List[Tuple[float, int, int, str]] = []
+    for u in units:
+        dmap = dist_map.get(u.id, {})
+        for p in pods:
+            d = dmap.get(p.current_node)
+            if d is None:
+                continue
+            triples.append((d, p.entry_time, u.id, p.id))
+
+    triples.sort()
+
+    assigned_units = set()
+    assigned_pods = set()
+    _claimed_by.clear()
+    _unit_claim.clear()
+
+    for d, entry_time, uid, pid in triples:
+        if uid in assigned_units or pid in assigned_pods:
+            continue
+        assigned_units.add(uid)
+        assigned_pods.add(pid)
+        _claimed_by[pid] = uid
+        _unit_claim[uid] = pid
+
+
+
 def _pick_route_target(unit_id: int, state: GraphState) -> Optional[int]:
     """Decide which node this drive unit should be heading toward: the
     nearest destination among pods it's carrying, or the nearest pod it can
     still pick up, whichever is closer."""
     unit = state.get_drive_unit(unit_id)
-    dist_from_unit = _dijkstra(_forward_adj, unit.current_node)
 
+    # Prefer delivering the first-picked pod (FIFO) to avoid target
+    # oscillation; use A* to estimate source->target distance.
     delivery_target = None
     delivery_dist = float('inf')
-    for pod_id in unit.carrying:
-        pod = state.get_pod(pod_id)
-        if pod is None:
-            continue
-        d = dist_from_unit.get(pod.destination_station, float('inf'))
-        if d < delivery_dist:
-            delivery_dist = d
-            delivery_target = pod.destination_station
+    if unit.carrying:
+        first_pod = state.get_pod(unit.carrying[0])
+        if first_pod is not None:
+            delivery_target = first_pod.destination_station
+            delivery_dist = _a_star(unit.current_node, delivery_target)
 
     pickup_target = None
     pickup_dist = float('inf')
@@ -172,14 +284,15 @@ def _pick_route_target(unit_id: int, state: GraphState) -> Optional[int]:
         _clean_claim(unit_id, state)
         pod_id = _unit_claim.get(unit_id)
         if pod_id is None:
+            # no claim from global assign; compute a full distance map and
+            # claim the nearest pod using the existing helper.
+            dist_from_unit = _dijkstra(_forward_adj, unit.current_node)
             pod_id = _find_new_target_pod(unit_id, state, dist_from_unit)
         if pod_id is not None:
             pod = state.get_pod(pod_id)
             if pod is not None and pod.current_node is not None:
-                d = dist_from_unit.get(pod.current_node)
-                if d is not None:
-                    pickup_target = pod.current_node
-                    pickup_dist = d
+                pickup_target = pod.current_node
+                pickup_dist = _a_star(unit.current_node, pickup_target)
 
     if delivery_target is None:
         return pickup_target
@@ -281,24 +394,59 @@ def _next_hop(unit, target: int, state: GraphState) -> Optional[int]:
     best_open: Optional[Tuple[float, int]] = None
     best_wait: Optional[float] = None
 
+    def _reservation_wait(from_node: int, to_node: int, start_time: int, weight: float) -> Optional[float]:
+        """Return how many steps to wait until edge [from_node->to_node]
+        is free for a window of length `ceil(weight)`. Returns 0 if free,
+        positive number of steps if there's a visible ETA, or None if
+        unknown.
+        """
+        st = start_time
+        dur = math.ceil(weight)
+        end = st + dur
+        key = (from_node, to_node)
+        slots = _reservations.get(key, []) + _reservations.get((to_node, from_node), [])
+        overlapping = [ (s,e) for (s,e) in slots if not (e <= st or s >= end) ]
+        if not overlapping:
+            return 0.0
+        # earliest time when none of the overlapping reservations remain
+        latest_end = max(e for (_s,e) in overlapping)
+        return float(max(0, latest_end - st))
+
+    t = state.current_time_step
     for neighbor, weight in _forward_adj.get(current, []):
         remaining = dist_to_target.get(neighbor)
         if remaining is None:
             continue
         cost = weight + remaining
 
-        if is_valid_move(state, unit, neighbor):
+        # Check reservation and validity
+        reserved_wait = _reservation_wait(current, neighbor, t, weight)
+        move_open = is_valid_move(state, unit, neighbor) and (reserved_wait == 0.0)
+
+        if move_open:
             if best_open is None or cost < best_open[0]:
                 best_open = (cost, neighbor)
         else:
-            wait = _estimated_wait(state, current, neighbor)
-            if wait is not None:
-                total = wait + cost
-                if best_wait is None or total < best_wait:
-                    best_wait = total
+            wait1 = _estimated_wait(state, current, neighbor)
+            wait2 = reserved_wait
+            # if either estimate is None, we treat overall wait as unknown
+            if wait1 is None and wait2 is None:
+                continue
+            waits = [w for w in (wait1, wait2) if w is not None]
+            if not waits:
+                continue
+            total = min(waits) + cost
+            if best_wait is None or total < best_wait:
+                best_wait = total
 
     if best_open is not None and (best_wait is None or best_open[0] <= best_wait):
-        return best_open[1]
+        # Reserve the chosen edge for the unit for the upcoming time window
+        neighbor = best_open[1]
+        edge = state.get_edge(current, neighbor)
+        if edge is not None:
+            dur = math.ceil(edge.weight)
+            _reserve_edge(current, neighbor, state.current_time_step, state.current_time_step + dur)
+        return neighbor
 
     # Nothing open is as good as waiting for something blocked would be
     # (or nothing is open at all) - hold position and re-evaluate next step.
@@ -323,6 +471,15 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
                       at the current node
     """
     _ensure_graph(state)
+
+    global _last_assign_time
+    # Run a single global greedy assignment once per timestep to claim pods
+    if state.current_time_step != _last_assign_time:
+        _last_assign_time = state.current_time_step
+        for uid in (u.id for u in state.drive_units):
+            _clean_claim(uid, state)
+        _global_greedy_assign(state)
+        _cleanup_reservations(state)
 
     unit = state.get_drive_unit(drive_unit_id)
     if unit is None or unit.in_transit:
